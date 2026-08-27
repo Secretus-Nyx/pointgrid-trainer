@@ -275,6 +275,7 @@
     padding: 14px 22px 18px;
     display: flex;
     justify-content: flex-end;
+    gap: 10px;
     border-top: 1px solid var(--border);
   }
   .card-actions .btn { min-width: 140px; }
@@ -407,6 +408,7 @@
       <input type="number" id="roundsInput" min="1" max="100" step="1" value="10" inputmode="numeric">
     </label>
     <button type="button" class="btn" id="startBtn">开始训练</button>
+    <button type="button" class="btn ghost" id="retrainBtn" disabled>重练上次</button>
   </div>
 </header>
 
@@ -452,6 +454,7 @@
   <div class="card">
     <div class="card-body" id="overlayBody"></div>
     <div class="card-actions">
+      <button type="button" class="btn ghost" id="overlayBtn2" hidden>—</button>
       <button type="button" class="btn" id="overlayBtn">确定</button>
     </div>
   </div>
@@ -466,7 +469,6 @@ const LIMITS = {
   rounds: { min: 1, max: 100 }
 };
 const LS_KEY = 'pointgrid_trainer_v1';
-const HISTORY_LIMIT = 50;
 
 const $ = (id) => document.getElementById(id);
 const refCanvas = $('refCanvas');
@@ -480,12 +482,14 @@ let size = 0;
 let dpr = 1;
 let activePointerId = null;
 let reportData = { rounds: null, grid: 10 };   // 报告缩略图数据
+let presetRounds = null;   // 「重练上次」时注入的固定多轮点位（数组的数组）
 
 /* ---------- 工具 ---------- */
 function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
 function mean(arr) { return arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : 0; }
 function fmt(n, d = 3) { return Number(n).toFixed(d); }
 function signed(v) { return (v >= 0 ? '+' : '') + v.toFixed(3); }
+function roundCoord(v) { return Math.round(v * 10000) / 10000; }
 
 /* 误差 → 0~100 分：线性衰减，阈值 0.25（归一化），误差 0 得满分，≥0.25 得 0 分 */
 function scoreFromError(d) {
@@ -601,7 +605,9 @@ function currentRound() {
   if (!session) return null;
   let r = session.rounds[session.roundIndex];
   if (!r) {
-    r = { points: genPoints(settings.points), clicks: [], answered: false, results: null, score: 0 };
+    const pre = presetRounds && presetRounds[session.roundIndex];
+    const pts = pre ? pre.slice() : genPoints(settings.points);
+    r = { points: pts, clicks: [], answered: false, results: null, score: 0 };
     session.rounds[session.roundIndex] = r;
   }
   return r;
@@ -744,6 +750,23 @@ workCanvas.addEventListener('contextmenu', (e) => e.preventDefault());
 /* ---------- 流程 ---------- */
 function start() {
   readSettings();
+  presetRounds = null;
+  beginSession();
+}
+
+function retrainLast() {
+  const s = loadStats();
+  const h = s.history && s.history[0];
+  if (!h || !h.roundsData || !h.roundsData.length) return;
+  settings.grid = h.grid;
+  settings.mode = h.mode;
+  settings.points = h.points;
+  settings.rounds = h.roundsData.length;
+  presetRounds = h.roundsData.map((r) => r.points.slice());
+  beginSession();
+}
+
+function beginSession() {
   session = { roundIndex: 0, rounds: [] };
   activePointerId = null;
   setControlsEnabled(false);
@@ -782,6 +805,20 @@ function advance() {
   }
 }
 
+function undoLastStroke() {
+  const round = currentRound();
+  if (!session || !round || round.clicks.length === 0) return;
+  round.clicks.pop();
+  if (round.answered) {
+    round.answered = false;
+    round.results = null;
+    round.score = 0;
+  }
+  hideOverlay();
+  draw();
+  updateHud();
+}
+
 function exitSession() {
   // 连续训练（Mode B）中退出：保留已完成的题（未完成的当前题丢弃），并弹出与正常完成一致的总结界面
   let summary = null;
@@ -795,12 +832,13 @@ function exitSession() {
   session = null;
   activePointerId = null;
   hideOverlay();
+  if (summary) showReport(summary);
+  readSettings();
   setControlsEnabled(true);
   $('startBtn').textContent = '开始训练';
   $('startBtn').disabled = false;
   draw();
   updateHud();
-  if (summary) showReport(summary);
 }
 
 function summaryOf(rounds) {
@@ -818,10 +856,10 @@ function summaryOf(rounds) {
 function finishSession() {
   const summary = summaryOf(session.rounds);
   saveStats(summary);
-  if (settings.mode === 'B') showReport(summary);
-  else showModeASummary(summary);
+  showReport(summary);
 
   session = null;
+  readSettings();
   setControlsEnabled(true);
   $('startBtn').textContent = '开始训练';
   $('startBtn').disabled = false;
@@ -852,12 +890,13 @@ function showFeedback(round) {
     '</tr></thead><tbody>' + rows + '</tbody></table>' +
     '<div class="score-line">本题得分 <strong>' + round.score.toFixed(1) + '</strong></div>',
     last ? '查看结果' : '下一题',
-    () => { if (last) finishSession(); else advance(); }
+    () => { if (last) finishSession(); else advance(); },
+    { text: '撤销上一笔', onClick: undoLastStroke }
   );
 }
 
-function showReport(s) {
-  reportData = { rounds: s.rounds, grid: settings.grid };
+function showReport(s, grid) {
+  reportData = { rounds: s.rounds, grid: grid != null ? grid : settings.grid };
   const details = s.rounds.map((r, i) => {
     const rows = r.points.map((p, j) => {
       const res = r.results[j];
@@ -901,32 +940,27 @@ function bindReportMiniCanvases() {
   });
 }
 
-function showModeASummary(s) {
-  showOverlay(
-    '<h2>训练完成</h2>' +
-    '<div class="stat-grid">' +
-    '<div>总题数<strong>' + s.rounds.length + '</strong></div>' +
-    '<div>平均分<strong>' + s.avgScore.toFixed(1) + '</strong></div>' +
-    '<div>平均误差<strong>' + (s.avgError * 100).toFixed(1) + '%</strong></div>' +
-    '<div>最佳成绩<strong>' + s.best.toFixed(1) + '</strong></div>' +
-    '<div>最差成绩<strong>' + s.worst.toFixed(1) + '</strong></div>' +
-    '</div>',
-    '重新训练',
-    () => {}
-  );
-}
-
-function showOverlay(html, btnText, action) {
+function showOverlay(html, btnText, action, secondary) {
   $('overlayBody').innerHTML = html;
   const btn = $('overlayBtn');
   btn.textContent = btnText;
   btn.onclick = () => { hideOverlay(); action(); };
+  const btn2 = $('overlayBtn2');
+  if (secondary) {
+    btn2.hidden = false;
+    btn2.textContent = secondary.text;
+    btn2.onclick = secondary.onClick;
+  } else {
+    btn2.hidden = true;
+    btn2.onclick = null;
+  }
   $('overlay').hidden = false;
 }
 function hideOverlay() { $('overlay').hidden = true; }
 
 /* ---------- HUD ---------- */
 function updateHud() {
+  updateRetrainBtn();
   const status = $('status'), hint = $('hint'), undoBtn = $('undoBtn'), actionBtn = $('actionBtn');
   const progTag = $('progTag');
   const exitBtn = $('exitBtn');
@@ -951,14 +985,8 @@ function updateHud() {
   status.textContent = '第 ' + (session.roundIndex + 1) + '/' + settings.rounds + ' 题';
   progTag.textContent = (session.roundIndex + 1) + '/' + settings.rounds;
 
-  undoBtn.disabled = done === 0 || round.answered;
-  undoBtn.onclick = () => {
-    if (done > 0 && !round.answered) {
-      round.clicks.pop();
-      draw();
-      updateHud();
-    }
-  };
+  undoBtn.disabled = done === 0;
+  undoBtn.onclick = undoLastStroke;
 
   if (!round.answered) {
     hint.textContent = n > 1 ? '请用 Pencil 依次点击点 ' + (done + 1) : '请在右侧用 Pencil 点击目标位置';
@@ -1032,6 +1060,7 @@ function initSettings() {
   });
 
   $('startBtn').addEventListener('click', start);
+  $('retrainBtn').addEventListener('click', retrainLast);
   $('exitBtn').addEventListener('click', exitSession);
   $('histBtn').addEventListener('click', showHistory);
   $('clearBtn').addEventListener('click', clearHistory);
@@ -1058,9 +1087,14 @@ function saveStats(rec) {
     avgScore: rec.avgScore,
     avgError: rec.avgError,
     best: rec.best,
-    worst: rec.worst
+    worst: rec.worst,
+    // 保留每题的归一化点位与用户尝试点（供「重练上次」/ 历史回溯），坐标保留 4 位小数以省空间
+    roundsData: rec.rounds.map((r) => ({
+      points: r.points.map((p) => ({ x: roundCoord(p.x), y: roundCoord(p.y) })),
+      clicks: r.clicks.map((c) => ({ x: roundCoord(c.x), y: roundCoord(c.y) })),
+      score: r.score
+    }))
   });
-  if (s.history.length > HISTORY_LIMIT) s.history.length = HISTORY_LIMIT;
   try { localStorage.setItem(LS_KEY, JSON.stringify(s)); } catch (e) {}
   renderStatsBar();
 }
@@ -1068,6 +1102,13 @@ function renderStatsBar() {
   const s = loadStats();
   $('statSessions').textContent = String(s.sessions);
   $('statAvg').textContent = s.sessions ? (s.totalScore / s.sessions).toFixed(1) : '—';
+  updateRetrainBtn();
+}
+function updateRetrainBtn() {
+  const s = loadStats();
+  const h = s.history && s.history[0];
+  const hasLast = !!(h && h.roundsData && h.roundsData.length);
+  $('retrainBtn').disabled = !!session || !hasLast;
 }
 function clearHistory() {
   if (!window.confirm('确定要清空所有训练历史记录吗？此操作不可撤销。')) return;
@@ -1080,7 +1121,7 @@ function showHistory() {
   if (!s.history.length) {
     body = '<h2>历史记录</h2><p style="color:#6b7280">暂无训练记录。</p>';
   } else {
-    const items = s.history.map((h) => {
+    const items = s.history.map((h, i) => {
       const d = new Date(h.ts);
       const t = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' +
         String(d.getDate()).padStart(2, '0') + ' ' + String(d.getHours()).padStart(2, '0') + ':' +
@@ -1093,11 +1134,43 @@ function showHistory() {
         '<span>' + h.rounds + ' 题</span>' +
         '<span>平均分 ' + h.avgScore.toFixed(1) + '</span>' +
         '<span>误差 ' + (h.avgError * 100).toFixed(1) + '%</span>' +
+        '<button type="button" class="btn ghost view-hist" data-idx="' + i + '" style="min-height:32px;font-size:12px;margin-left:auto">查看</button>' +
         '</div>';
     }).join('');
     body = '<h2>历史记录</h2><div class="history-list">' + items + '</div>';
   }
   showOverlay(body, '关闭', () => {});
+  document.querySelectorAll('#overlayBody .view-hist').forEach((b) => {
+    b.addEventListener('click', () => viewHistoryReport(+b.dataset.idx));
+  });
+}
+
+function reconstructRounds(roundsData) {
+  return roundsData.filter((d) => d && d.points && d.clicks).map((d) => {
+    const results = d.points.map((p, i) => {
+      const u = d.clicks[i];
+      const dx = u.x - p.x, dy = u.y - p.y;
+      const dist = Math.hypot(dx, dy);
+      return { dx, dy, d: dist, score: scoreFromError(dist), dir: directionOf(dx, dy) };
+    });
+    return { points: d.points, clicks: d.clicks, results: results, answered: true, score: d.score };
+  });
+}
+
+function viewHistoryReport(idx) {
+  const s = loadStats();
+  const h = s.history[idx];
+  if (!h) return;
+  if (!h.roundsData || !h.roundsData.length) {
+    showOverlay('<h2>历史记录</h2><p style="color:#6b7280">该记录暂无详细点位数据。</p>', '关闭', () => {});
+    return;
+  }
+  const rounds = reconstructRounds(h.roundsData);
+  if (!rounds.length) {
+    showOverlay('<h2>历史记录</h2><p style="color:#6b7280">该记录暂无详细点位数据。</p>', '关闭', () => {});
+    return;
+  }
+  showReport({ rounds, avgScore: h.avgScore, avgError: h.avgError, best: h.best, worst: h.worst }, h.grid);
 }
 
 /* ---------- 启动 ---------- */
